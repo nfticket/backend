@@ -3,25 +3,20 @@
 
 import math
 import logging
-import itertools
 import argparse
 
 from grab import Grab, proxylist
 from grab.spider import Spider, Task
 
-from elasticsearch import Elasticsearch
+from elasticsearch import Elasticsearch, NotFoundError
 
-
-_API_KEY = 'ckey_95c202a743e24270bc7f1706c4c'
 
 _CACHE_DB_NAME = 'nft'
 _CACHE_DSN = 'postgres://zaebee@'
 
 _API_URL = 'https://api.covalenthq.com/v1'
 _TOKENS_ENDPOINT = '{api}/{chain}/tokens/{address}/nft_token_ids/?page-number={page}'
-_TOKENS_METADATA_ENDPOINT = '{api}/{chain}/tokens/nft_metadata/{token}'
-
-_BASE_CONFIG = {'chain': 56}
+_TOKENS_METADATA_ENDPOINT = '{api}/{chain}/tokens/{address}/nft_metadata/{token}/'
 
 _PROXY_URL = (
     'https://www.proxyscan.io/api/proxy'
@@ -38,34 +33,34 @@ logging.basicConfig(
     filename='nft.log',
     level=logging.INFO)
 
-parser = argparse.ArgumentParser()
-parser.add_argument(
+PARSER = argparse.ArgumentParser()
+PARSER.add_argument(
     '-v', '--verbose',
     type=str,
     default='INFO',
     help='Logging level, for example: DEBUG or WARNING.')
-parser.add_argument(
+PARSER.add_argument(
     '-e', '--elastic-host',
     type=str,
     required=True,
     help='Provides host:port for elasticsearch indexer.')
-parser.add_argument(
+PARSER.add_argument(
     '-k', '--api-key',
     type=str,
     required=True,
     help='Provides API KEY for covalenthq.com service.')
-parser.add_argument(
+PARSER.add_argument(
     '-c', '--chain',
     type=int,
     required=True,
     help='Provides Chain ID to parse.')
-parser.add_argument(
+PARSER.add_argument(
     '-a', '--address',
     type=str,
     required=True,
     help='Provides contract address to parse.')
 
-parser.add_argument(
+PARSER.add_argument(
     '-p', '--proxytype',
     type=str,
     default='http',
@@ -111,12 +106,14 @@ class NFTSpider(Spider):
     def shutdown(self):
         self._es.indices.refresh(index='nft')
 
-    def _build_url(self, endpoint, page=0):
+    def _build_url(self, endpoint, page=0, token=None):
+        token = token or ''
         url = endpoint.format(
             api=_API_URL,
             chain=self._chain,
             address=self._address,
             api_key=self._api_key,
+            token=token,
             page=page)
         return url
 
@@ -125,57 +122,73 @@ class NFTSpider(Spider):
         yield Task('first_page', url, page=0)
 
     def task_first_page(self, grab, task):
-        resp = grab.doc.json['data']
-        pages = _get_pages(resp['pagination'])
-        self._bulk_index(resp['items'])
-        logging.info('Done NFT[address:{}][chain:{}][page:{}/{}]'.format(
-            self._address, self._chain, task.page, pages))
+        tokens = grab.doc.json['data']['items']
+        self._bulk_index(tokens)
+        for token in tokens:
+            url = self._build_url(
+                _TOKENS_METADATA_ENDPOINT, token=token['token_id'])
+            yield Task('token_metadata', url, token=token)
+        pages = _get_pages(grab.doc.json['data']['pagination'])
         for page in range(1, pages + 1):
             url = self._build_url(_TOKENS_ENDPOINT, page)
-            logging.info('Fetch URL: %s' % url)
             yield Task('next_page', url, page=page, num_pages=pages)
+        msg = 'Done NFT[address:%s][chain:%s][page:%s/%s]'
+        logging.info(msg, self._address, self._chain, task.page, pages)
 
     def task_next_page(self, grab, task):
-        msg = ('Done NFT[address:{}][chain:{}][page:{}/{}]').format(
-            self._address, self._chain, task.page, task.num_pages)
-        logging.info(msg)
-        resp = grab.doc.json['data']
-        self._bulk_index(resp['items'])
+        msg = 'Done NFT[address:{}][chain:{}][page:{}/{}]'
+        logging.info(
+            msg, self._address, self._chain, task.page, task.num_pages)
+        tokens = grab.doc.json['data']['items']
+        self._bulk_index(tokens)
+        for token in tokens:
+            url = self._build_url(
+                _TOKENS_METADATA_ENDPOINT, token=token['token_id'])
+            yield Task('token_metadata', url, token=token)
 
     def _bulk_index(self, tokens):
-        tmp = []
-
+        body = []
         for token in tokens:
-            doc = token
             data = {
                 '_index': self._address,
+                '_id': token['token_id'],
                 '_type': 'nft',
-                '_id': token['token_id']
             }
-            data = {'update': data}
             # bulk operation instructions/details
-            tmp.append(data)
-            # only append bulk operation data if it's not a delete operation
-            tmp.append({'doc': doc, 'doc_as_upsert': True})
-        if tmp:
-            self._es.bulk(tmp, refresh=True)
+            body.append({'update': data})
+            body.append({'doc': token, 'doc_as_upsert': True})
+        if body:
+            self._es.bulk(body, refresh=True)
         self.counter += len(tokens)
-        logging.info('Indexed NFT: [%s]', len(tokens))
+        logging.info('Indexed NFT: [%s]', self.counter)
+
+    def task_token_metadata(self, grab, task):
+        token = task.token
+        msg = 'Done NFT data: [address:%s][token:%s]'
+        logging.info(msg, self._address, token['token_id'])
+        metadata = grab.doc.json['data']['items']
+        if len(metadata) != 1:
+            msg = 'NFT:%s has more than 1 metadata, please check: %s'
+            logging.warning(msg, token['token_id'], task.url)
+            return
+        # TODO build array of token metadata for fastest updating.
+        token.update(metadata[0])
+        self._bulk_index([token])
 
 
 if __name__ == '__main__':
-    arguments = parser.parse_args()
+    arguments = PARSER.parse_args()
     proxytype = arguments.proxytype
     proxyurl = _PROXY_URL.format(
-            'http,https' if proxytype == 'http' else proxytype)
+        'http,https' if proxytype == 'http' else proxytype)
     logging.root.setLevel(arguments.verbose)
-    config = _BASE_CONFIG.copy()
-    config['chain'] = arguments.chain
-    config['address'] = arguments.address
-    config['api_key'] = arguments.api_key
-    config['elastic_host'] = arguments.elastic_host
-
-    bot = NFTSpider(network_try_limit=5, thread_number=2, config=config)
+    config = {
+        'chain': arguments.chain,
+        'address': arguments.address,
+        'api_key': arguments.api_key,
+        'elastic_host': arguments.elastic_host
+    }
+    bot = NFTSpider(network_try_limit=5, thread_number=1, config=config)
     logging.info('Bot initialzed with config: %s', bot.config)
     bot.setup_cache('postgresql', _CACHE_DB_NAME, dsn=_CACHE_DSN)
     # bot.load_proxylist(proxyurl, 'url', proxytype)
