@@ -18,6 +18,7 @@ _CACHE_DSN = 'postgres://zaebee@'
 _API_URL = 'https://api.covalenthq.com/v1'
 _TOKENS_ENDPOINT = '{api}/{chain}/tokens/{address}/nft_token_ids/?page-number={page}'
 _TOKENS_METADATA_ENDPOINT = '{api}/{chain}/tokens/{address}/nft_metadata/{token}/'
+_TOKENS_TRANSACTIONS_ENDPOINT = '{api}/{chain}/tokens/{address}/nft_transactions/{token}/'
 
 _PROXY_URL = (
     'https://www.proxyscan.io/api/proxy'
@@ -146,9 +147,10 @@ class NFTSpider(Spider):
         if ids:
             for _id in ids:
                 token = self._es.get(self._address, _id, 'nft')['_source']
-                if 'nft_data' in token and  'token_url' in token['nft_data']:
-                    url = token['nft_data']['token_url']
-                    yield Task('token_external_data', url, token=token)
+                if 'token_id' in token:
+                    url = self._build_url(
+                        _TOKENS_METADATA_ENDPOINT, token=token['token_id'])
+                    yield Task('token_metadata', url, token=token)
         else:
             url = self._build_url(_TOKENS_ENDPOINT)
             yield Task('first_page', url, page=0)
@@ -182,23 +184,23 @@ class NFTSpider(Spider):
             if token['token_id']:
                 yield Task('token_metadata', url, token=token)
 
-    def _bulk_index(self, tokens):
+    def _bulk_index(self, docs, index=None, id_key='token_id', doc_type='nft'):
         body = []
-        for token in tokens:
-            if not token['token_id']:
+        for doc in docs:
+            if not doc[id_key]:
                 continue
             data = {
-                '_index': self._address,
-                '_id': token['token_id'],
-                '_type': 'nft',
+                '_id': doc[id_key],
+                '_type': doc_type,
+                '_index': index or self._address,
             }
             # bulk operation instructions/details
             data = {'update': data}
             body.append(data)
-            body.append({'doc': token, 'doc_as_upsert': True})
+            body.append({'doc': doc, 'doc_as_upsert': True})
         if body:
             self._es.bulk(body, refresh=True)
-        logging.info('Indexed NFT total: [%s]', self.counter)
+        logging.info('Indexed %s total: [%s]', doc_type.upper(), self.counter)
 
     def task_token_metadata(self, grab, task):
         token = task.token
@@ -219,6 +221,9 @@ class NFTSpider(Spider):
             yield Task('token_external_data', url, token=token)
         else:
             self._bulk_index([token])
+        url = self._build_url(
+            _TOKENS_TRANSACTIONS_ENDPOINT, token=token['token_id'])
+        yield Task('token_transactions', url, token=token)
 
     def task_token_external_data(self, grab, task):
         token = task.token
@@ -231,6 +236,19 @@ class NFTSpider(Spider):
                 token['nft_data']['external_data'] = metadata
                 token['nft_data'] = _cast_attrs(token['nft_data'])
         self._bulk_index([token])
+
+    def task_token_transactions(self, grab, task):
+        token = task.token
+        msg = 'Done NFT transactions: [address:%s][token:%s]'
+        logging.info(msg, self._address, token['token_id'])
+        if grab.doc.code == 200:
+            data = grab.doc.json['data']['items']
+            if data:
+                trx = data[0].get('nft_transactions', [])
+                for tr in trx:
+                    tr['token_id'] = token['token_id']
+                index = 'transaction-%s' % self._address
+                self._bulk_index(trx, index, 'tx_hash', 'transaction')
 
 
 if __name__ == '__main__':
