@@ -9,6 +9,7 @@ from grab import Grab, proxylist
 from grab.spider import Spider, Task
 
 from elasticsearch import Elasticsearch, NotFoundError
+from elasticsearch_dsl import Search
 
 
 _CACHE_DB_NAME = 'nft'
@@ -61,11 +62,24 @@ PARSER.add_argument(
     help='Provides contract address to parse.')
 
 PARSER.add_argument(
+    '-t', '--ids',
+    type=str,
+    help='Specified token IDs to collect. For example: 123,124,125')
+
+PARSER.add_argument(
     '-p', '--proxytype',
     type=str,
     default='http',
     choices=['http', 'socks4', 'socks5'],
     help='Set of proxy type.')
+
+
+_MAPPING_META = {
+    'AIRT': lambda r: r['nft'],
+    'MNA_NFT': lambda r: r,
+    'GEGO-V2': lambda r: r['result']['data'],
+    'CocosNFT': lambda r: r['result']['data'],
+}
 
 
 def _get_pages(pagination):
@@ -77,14 +91,15 @@ def _get_pages(pagination):
 
 
 def _cast_attrs(nft_data):
-    try:
-        attrs = nft_data['external_data']['attributes']
-        for i, _ in enumerate(attrs):
-            attrs[i]['value'] = str(attrs[i]['value'])
-        nft_data['external_data']['attributes'] = attrs
+    if not nft_data['external_data']:
         return nft_data
-    except KeyError:
+    if 'attributes' not in nft_data['external_data']:
         return nft_data
+    attrs = nft_data['external_data']['attributes'] or []
+    for i, _ in enumerate(attrs):
+        attrs[i]['value'] = str(attrs[i]['value'])
+    nft_data['external_data']['attributes'] = attrs
+    return nft_data
 
 
 class NFTSpider(Spider):
@@ -126,11 +141,21 @@ class NFTSpider(Spider):
         return url
 
     def task_generator(self):
-        url = self._build_url(_TOKENS_ENDPOINT)
-        yield Task('first_page', url, page=0)
+        ids = self.config.get('ids', '')
+        ids = ids.split(',') if ids else []
+        if ids:
+            for _id in ids:
+                token = self._es.get(self._address, _id, 'nft')['_source']
+                if 'nft_data' in token and  'token_url' in token['nft_data']:
+                    url = token['nft_data']['token_url']
+                    yield Task('token_external_data', url, token=token)
+        else:
+            url = self._build_url(_TOKENS_ENDPOINT)
+            yield Task('first_page', url, page=0)
 
     def task_first_page(self, grab, task):
         tokens = grab.doc.json['data']['items']
+        self.counter += len(tokens)
         self._bulk_index(tokens)
         for token in tokens:
             url = self._build_url(
@@ -149,6 +174,7 @@ class NFTSpider(Spider):
         logging.info(
             msg, self._address, self._chain, task.page, task.num_pages)
         tokens = grab.doc.json['data']['items']
+        self.counter += len(tokens)
         self._bulk_index(tokens)
         for token in tokens:
             url = self._build_url(
@@ -172,8 +198,7 @@ class NFTSpider(Spider):
             body.append({'doc': token, 'doc_as_upsert': True})
         if body:
             self._es.bulk(body, refresh=True)
-        self.counter += len(tokens)
-        logging.info('Indexed NFT: [%s]', self.counter)
+        logging.info('Indexed NFT total: [%s]', self.counter)
 
     def task_token_metadata(self, grab, task):
         token = task.token
@@ -189,7 +214,24 @@ class NFTSpider(Spider):
             nft_data = metadata[0].pop('nft_data')
             token['nft_data'] = _cast_attrs(nft_data[0] if nft_data else {})
         token.update(metadata[0])
+        url = token['nft_data'].get('token_url', None)
+        if url:
+            yield Task('token_external_data', url, token=token)
+        else:
+            self._bulk_index([token])
+
+    def task_token_external_data(self, grab, task):
+        token = task.token
+        msg = 'Done external NFT data: [address:%s][token:%s]'
+        logging.info(msg, self._address, token['token_id'])
+        if grab.doc.code == 200:
+            data = grab.doc.json
+            if token['contract_ticker_symbol'] in _MAPPING_META:
+                metadata = _MAPPING_META[token['contract_ticker_symbol']](data)
+                token['nft_data']['external_data'] = metadata
+                token['nft_data'] = _cast_attrs(token['nft_data'])
         self._bulk_index([token])
+
 
 if __name__ == '__main__':
     arguments = PARSER.parse_args()
@@ -201,7 +243,8 @@ if __name__ == '__main__':
         'chain': arguments.chain,
         'address': arguments.address,
         'api_key': arguments.api_key,
-        'elastic_host': arguments.elastic_host
+        'elastic_host': arguments.elastic_host,
+        'ids': arguments.ids
     }
     bot = NFTSpider(network_try_limit=5, thread_number=5, config=config)
     logging.info('Bot initialzed with config: %s', bot.config)
