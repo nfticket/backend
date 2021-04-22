@@ -1,0 +1,9 @@
+elasticsearch==7.12.0
+elasticsearch-dsl==7.3.0
+grab==0.6.41
+lxml==4.6.3
+psycopg2==2.8.6
+psycopg2-binary==2.8.6
+pycurl==7.43.0.1
+python-dateutil==2.8.1
+requests==2.25.1
