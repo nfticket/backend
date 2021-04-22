@@ -1,11 +1,9 @@
-# backend
 Backend to aggregate tokens data.
 =======
-# Case parser for sudrf.ru
 
 ## Usage
 
-`./court_bot.py -h`
+`./nft_bot.py -h`
 
 ```
 usage: nft_bot.py [-h] [-v VERBOSE] -e ELASTIC_HOST -k API_KEY -c CHAIN -a
