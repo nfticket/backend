@@ -32,4 +32,4 @@ optional arguments:
 
 Parse tokens for Binance Smart Chain (56 chain_id)  and Mina NFT:
 
-`./nft_bot.py -c 56 -a 0x828e90cef49b3baea41590ebf7f274d49f845dbb -e localhost:9200 -k api_key
+`./nft_bot.py -c 56 -a 0x828e90cef49b3baea41590ebf7f274d49f845dbb -e localhost:9200 -k api_key`
